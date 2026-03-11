@@ -64,3 +64,6 @@ fastlane/test_output
 .codemogger
 
 dist/
+package.json
+node_modules
+bun.lock*

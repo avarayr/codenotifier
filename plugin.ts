@@ -10,7 +10,9 @@
 import type { Plugin } from "@opencode-ai/plugin";
 
 // CHANGE THIS IF YOU MOVE THE BINARY
-const bin = process.env.CODENOTIFIER_BIN ?? `opencode-toast`;
+const bin =
+  Bun.env.CODENOTIFIER_BIN ??
+  `/Users/mika/experiments/codenotifier/dist/opencode-toast`;
 
 function trim(value: string, max = 140) {
   if (value.length <= max) return value;
@@ -157,7 +159,6 @@ export const NotificationPlugin: Plugin = async (pluginInput) => {
       if (event.type === "permission.replied") {
         const props = event.properties as any;
         const id = props.requestID || props.permissionID;
-        if (!id) return;
 
         const proc = processes.get(id);
         if (proc) {
@@ -187,24 +188,19 @@ export const NotificationPlugin: Plugin = async (pluginInput) => {
 
         const reply = legacyReply(out) === "allow" ? "once" : "reject";
 
-        const url = new URL(
-          `permission/${props.id}/reply`,
-          pluginInput.serverUrl
-        );
+        // @ts-expect-error - _client is protected but we need to access it
+        const client = pluginInput.client._client ?? pluginInput.client.client;
+        const customFetch = client?.getConfig?.()?.fetch;
 
-        // Extract the custom fetch function injected by OpenCode
-        // which bypasses network issues and talks directly to the local router
-        const internalClient = (pluginInput.client as any)._client;
-        const customFetch: typeof fetch =
-          internalClient?.getConfig?.()?.fetch ?? fetch;
-
-        await customFetch(
-          new Request(url.toString(), {
+        await customFetch?.(
+          new Request(`/permission/${props.id}/reply`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ reply }),
           })
-        ).catch(() => {});
+        ).catch((e) => {
+          console.log("[plugin] fetch error:", e);
+        });
       }
     },
   };
