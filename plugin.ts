@@ -8,11 +8,37 @@
  */
 
 import type { Plugin } from "@opencode-ai/plugin";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { existsSync } from "node:fs";
+import { text } from "node:stream/consumers";
 
 // CHANGE THIS IF YOU MOVE THE BINARY
-const bin =
-  Bun.env.CODENOTIFIER_BIN ??
-  `/Users/mika/experiments/codenotifier/dist/opencode-toast`;
+const bin = process.env.CODENOTIFIER_BIN ?? `opencode-toast`;
+
+type PermissionAsked = {
+  id: string;
+  sessionID: string;
+  permission: string;
+  patterns: string[];
+  metadata: Record<string, unknown>;
+};
+
+type PermissionReplied = {
+  requestID?: string;
+  permissionID?: string;
+};
+
+type ClientConfig = {
+  fetch?: typeof fetch;
+  headers?: HeadersInit;
+};
+
+type ClientWithConfig = {
+  _client?: {
+    getConfig?: () => ClientConfig;
+  };
+};
 
 function trim(value: string, max = 140) {
   if (value.length <= max) return value;
@@ -101,46 +127,47 @@ function legacyReply(out: string) {
 
 async function toast(
   id: string,
-  processes: Map<string, any>,
+  processes: Map<string, { kill: () => boolean }>,
   permission: string,
   data: Record<string, unknown>,
   patterns: string[]
 ) {
-  const proc = Bun.spawn({
-    cmd: [
-      bin,
-      "--title",
-      title(permission),
-      "--subtitle",
-      subtitle(permission),
-      "--message",
-      line(data, permission, patterns),
-      "--actions",
-      "Deny,Allow",
-      "--roles",
-      "neutral,primary",
-      "--tone",
-      "info",
-      "--sound",
-      "Bottle",
-      "--timeout",
-      "0",
-    ],
-    stdout: "pipe",
-    stderr: "pipe",
+  const cmd = [
+    bin,
+    "--title",
+    title(permission),
+    "--subtitle",
+    subtitle(permission),
+    "--message",
+    line(data, permission, patterns),
+    "--actions",
+    "Deny,Allow",
+    "--roles",
+    "neutral,primary",
+    "--tone",
+    "info",
+    "--sound",
+    "Bottle",
+    "--timeout",
+    "0",
+  ];
+
+  const proc = spawn(cmd[0], cmd.slice(1), {
+    stdio: ["ignore", "pipe", "ignore"],
   });
 
   processes.set(id, proc);
+  const closed = once(proc, "close");
 
   try {
-    const text = await new Response(proc.stdout).text();
-    await proc.exited;
+    const out = await text(proc.stdout);
+    await closed;
 
     // If we were killed externally (replied event), the map entry would be gone
     if (!processes.has(id)) return null;
 
-    return text.trim();
-  } catch (e) {
+    return out.trim();
+  } catch {
     return null;
   } finally {
     processes.delete(id);
@@ -148,8 +175,8 @@ async function toast(
 }
 
 export const NotificationPlugin: Plugin = async (pluginInput) => {
-  const ok = await Bun.file(bin).exists();
-  const processes = new Map<string, any>();
+  const ok = existsSync(bin);
+  const processes = new Map<string, { kill: () => boolean }>();
 
   return {
     event: async ({ event }) => {
@@ -157,8 +184,9 @@ export const NotificationPlugin: Plugin = async (pluginInput) => {
        * Permission responded in the tui, kill the toast
        */
       if (event.type === "permission.replied") {
-        const props = event.properties as any;
-        const id = props.requestID || props.permissionID;
+        const props = event.properties as PermissionReplied;
+        const id = props.requestID ?? props.permissionID;
+        if (!id) return;
 
         const proc = processes.get(id);
         if (proc) {
@@ -173,7 +201,7 @@ export const NotificationPlugin: Plugin = async (pluginInput) => {
        */
       if ((event.type as string) === "permission.asked") {
         if (!ok) return;
-        const props = event.properties as any;
+        const props = event.properties as PermissionAsked;
         if (!props || !props.id) return;
 
         const out = await toast(
@@ -188,19 +216,27 @@ export const NotificationPlugin: Plugin = async (pluginInput) => {
 
         const reply = legacyReply(out) === "allow" ? "once" : "reject";
 
-        // @ts-expect-error - _client is protected but we need to access it
-        const client = pluginInput.client._client ?? pluginInput.client.client;
-        const customFetch = client?.getConfig?.()?.fetch;
+        const url = new URL(
+          `permission/${props.id}/reply`,
+          pluginInput.serverUrl
+        );
+        url.searchParams.set("directory", pluginInput.directory);
 
-        await customFetch?.(
-          new Request(`/permission/${props.id}/reply`, {
+        // Reuse OpenCode's injected fetch config; desktop requires its auth header.
+        const config = (
+          pluginInput.client as unknown as ClientWithConfig
+        )._client?.getConfig?.();
+        const customFetch = config?.fetch ?? fetch;
+        const headers = new Headers(config?.headers);
+        headers.set("Content-Type", "application/json");
+
+        await customFetch(
+          new Request(url.toString(), {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers,
             body: JSON.stringify({ reply }),
           })
-        ).catch((e) => {
-          console.log("[plugin] fetch error:", e);
-        });
+        ).catch(() => {});
       }
     },
   };
